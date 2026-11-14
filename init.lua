@@ -3,7 +3,7 @@
 -- Senão, baixa o instalador do GitHub e executa.
 
 local BOOT_PATH = "/PlasmaOS/boot.lua"
-local INSTALLER_URL = "https://raw.githubusercontent.com/pmiguel10766-stack/-opencomputers-script/main/instalacao.lua"
+local INSTALLER_URL = "https://raw.githubusercontent.com/pmiguel10766-stack/-opencomputers-script/refs/heads/main/instalador.lua"
 local TIMEOUT = 30
 local ATTEMPTS = 2
 
@@ -76,22 +76,31 @@ local function download(url)
   local ok, handle = pcall(net.request, url)
   if not ok or not handle then return nil, tostring(handle) end
 
-  local parts = {}
   local started = computer.uptime()
+
+  while not handle:finishConnect() do
+    if computer.uptime() - started > TIMEOUT then
+      handle:close()
+      return nil, "tempo esgotado ao conectar"
+    end
+    computer.pullSignal(0.1)
+  end
+
+  local parts = {}
   while true do
     if computer.uptime() - started > TIMEOUT then
       handle:close()
-      return nil, "tempo esgotado (" .. TIMEOUT .. "s)"
+      return nil, "tempo esgotado ao baixar"
     end
-    local chunk, reason = handle:read(math.huge)
-    if not chunk then
-      if reason then
-        handle:close()
-        return nil, tostring(reason)
-      end
+    local chunk, reason = handle:read(2048)
+    if chunk then
+      parts[#parts + 1] = chunk
+    elseif reason then
+      handle:close()
+      return nil, tostring(reason)
+    else
       break
     end
-    parts[#parts + 1] = chunk
   end
   handle:close()
 
@@ -121,7 +130,7 @@ else
   end
 
   if data then
-    runCode(data, "instalacao.lua")
+    runCode(data, "instalador.lua")
   else
     say("")
     say("Não foi possível baixar o instalador.")
@@ -129,7 +138,6 @@ else
   end
 end
 
--- Mantém a mensagem na tela se nada rodou
 while true do
   computer.pullSignal(1)
 end
