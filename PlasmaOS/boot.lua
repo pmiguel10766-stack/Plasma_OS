@@ -1,11 +1,11 @@
 -- Plasma OS - /PlasmaOS/boot.lua
--- Primeiro uso: assistente de usuário. Depois: área de trabalho.
--- Sem OpenOS. Requer GPU Tier 3 e tela.
--- Compatível com Lua 5.2 e 5.3 (sem operadores bit a bit, sem utf8).
+-- Assistente de usuário no primeiro uso, depois a área de trabalho.
+-- Carrega apps, ícones, fundos e biblioteca de /PlasmaOS/.
+-- Sem OpenOS. Lua 5.2 (sem operadores de bits).
 
 local BOOT_ADDR = computer.getBootAddress()
 local CFG_PATH  = "/PlasmaOS/usuario.cfg"
-local VERSION   = "0.4.1"
+local VERSION   = "0.5"
 
 local gpuAddr = component.list("gpu")()
 local scrAddr = component.list("screen")()
@@ -18,7 +18,7 @@ local w, h = gpu.getResolution()
 
 local bootFs = component.proxy(BOOT_ADDR)
 
--- Paleta
+-- Paleta do sistema
 local C = {
   menuBg = 0xE8E8E8, menuFg = 0x1A1A1A,
   dockBg = 0x9AA6B2, white = 0xFFFFFF,
@@ -28,48 +28,13 @@ local C = {
   titleActive = 0xBDBDBD, titleIdle = 0xF2F2F2,
 }
 
--- Fundos (alternados pelo menu Visualizar)
-local WALLPAPERS = {
-  { sky1 = 0x5B7A99, sky2 = 0xC9D6E2, rock = 0xC0643A, ground = 0x2F4A3B }, -- Montanha
-  { sky1 = 0x3B2A4F, sky2 = 0xF2A65A, rock = 0xD9582B, ground = 0x2B1D2E }, -- Entardecer
-}
-local wallIdx = 1
-
-local apps = {
-  { name = "Finder", letter = "F", color = 0x3A8FD9,
-    text = { "Pasta atual: /", "Navegação chega no próximo passo." } },
-  { name = "Safari", letter = "S", color = 0x2F80ED,
-    text = { "Navegador ainda não implementado." } },
-  { name = "Calendário", letter = "C", color = 0xE05252,
-    text = { "Calendário ainda não implementado." } },
-  { name = "Notas", letter = "N", color = 0xF2C94C,
-    text = { "Escreva suas notas aqui.", "(em breve)" } },
-  { name = "Fotos", letter = "P", color = 0x9B51E0,
-    text = { "Nenhuma foto encontrada." } },
-  { name = "Mensagens", letter = "M", color = 0x27AE60,
-    text = { "Nenhuma mensagem." } },
-  { name = "Ajustes", letter = "A", color = 0x7F8C8D,
-    text = { "Ajustes do Plasma OS.", "Versão " .. VERSION } },
-  { name = "Lixeira", letter = "L", color = 0xBDC3C7,
-    text = { "A lixeira está vazia." } },
-}
-
-local dockY  = h - 3
-local dockW  = #apps * 6 + 2
-local dockX0 = math.floor((w - dockW) / 2)
-
-local windows   = {}   -- último = topo
-local dragging  = nil  -- { win, dx, dy }
-local resizing  = nil  -- janela sendo redimensionada
-local cascade   = 0
-local running   = true
-local openMenu  = nil  -- menu suspenso aberto
-local dockLabel = nil  -- { idx, untilT }
-local MIN_W, MIN_H = 24, 6
-
 -- Utilidades ------------------------------------------------------------
 
-local function tlen(s) return unicode.len(s) end
+local function tlen(s)
+  local ok, n = pcall(function() return utf8.len(s) end)
+  if ok and n then return n end
+  return #s
+end
 
 local function mix(c1, c2, t)
   local r1, g1, b1 = math.floor(c1 / 65536) % 256, math.floor(c1 / 256) % 256, c1 % 256
@@ -110,6 +75,17 @@ local function writeFile(path, data)
   return true
 end
 
+-- Carrega um módulo Lua (tabela) de um arquivo do disco
+local function loadModule(path)
+  local src = readFile(path)
+  if not src then return nil end
+  local fn, err = load(src, "=" .. path, "t")
+  if not fn then return nil, err end
+  local ok, res = pcall(fn)
+  if ok and type(res) == "table" then return res end
+  return nil, res
+end
+
 -- Hash simples (djb2). Não é segurança forte, só evita senha em texto puro.
 local function hashPw(s)
   local hsh = 5381
@@ -133,21 +109,73 @@ local function hit(list, x, y)
   return nil
 end
 
--- Desenho base ----------------------------------------------------------
+-- Auxiliar gráfico passado para os apps (fill, text, clip, len)
+local G = {}
+function G.fill(x, y, cw, ch, bg)
+  gpu.setBackground(bg)
+  gpu.fill(x, y, cw, ch, " ")
+end
+function G.text(x, y, s, fg, bg)
+  if bg then gpu.setBackground(bg) end
+  if fg then gpu.setForeground(fg) end
+  gpu.set(x, y, tostring(s))
+end
+function G.clip(s, n)
+  s = tostring(s)
+  if tlen(s) <= n then return s end
+  return s:sub(1, n)
+end
+G.len = tlen
 
-local function drawWallpaper()
-  local p = WALLPAPERS[wallIdx]
-  local top, bottom = 2, h - 4
-  for y = top, bottom do
-    local t = (y - top) / math.max(1, bottom - top)
-    gpu.setBackground(mix(p.sky2, p.sky1, t))
-    gpu.fill(1, y, w, 1, " ")
+-- Biblioteca de trechos, fundos, apps e ícones -------------------------
+
+local TRECHOS = loadModule("/PlasmaOS/biblioteca/trechos.lua") or {}
+
+local DEFAULT_WALL = {
+  name = "Montanha", sky1 = 0x5B7A99, sky2 = 0xC9D6E2,
+  rock = 0xC0643A, ground = 0x2F4A3B, rockX = 0.08, rockW = 0.30, rockH = 0.35,
+}
+local WALLPAPERS = {}
+for _, f in ipairs({ "padrao", "montanha" }) do
+  local wp = loadModule("/PlasmaOS/fundos/" .. f .. ".lua")
+  if wp then WALLPAPERS[#WALLPAPERS + 1] = wp end
+end
+if #WALLPAPERS == 0 then WALLPAPERS[1] = DEFAULT_WALL end
+local wallIdx = 1
+
+local APP_FILES = {
+  "finder", "safari", "calendario", "notas", "fotos",
+  "mensagens", "ajustes", "lixeira", "editor-lua", "rede-local",
+}
+local apps = {}
+for _, f in ipairs(APP_FILES) do
+  local app = loadModule("/PlasmaOS/apps/" .. f .. ".lua")
+  if app then
+    app.file = f
+    app.icon = loadModule("/PlasmaOS/icones/" .. f .. ".lua")  -- pode ser nil
+    apps[#apps + 1] = app
   end
-  gpu.setBackground(p.rock)
-  gpu.fill(math.floor(w * 0.08), 6, math.floor(w * 0.30), math.floor(h * 0.35), " ")
-  gpu.setBackground(p.ground)
-  local gy = math.floor(h * 0.7)
-  gpu.fill(1, gy, w, bottom - gy + 1, " ")
+end
+
+-- Contexto entregue aos apps (preenchido em main)
+local CTX = {}
+
+-- Estado ----------------------------------------------------------------
+
+local windows   = {}   -- último = topo
+local dragging  = nil  -- { win, dx, dy }
+local resizing  = nil  -- janela sendo redimensionada
+local cascade   = 0
+local running   = true
+local openMenu  = nil  -- menu suspenso aberto
+local dockLabel = nil  -- { idx, untilT }
+local MIN_W, MIN_H = 24, 6
+local dockY, dockW, dockX0 = h - 3, 2, 1
+
+local function layoutDock()
+  dockY  = h - 3
+  dockW  = #apps * 6 + 2
+  dockX0 = math.floor((w - dockW) / 2)
 end
 
 -- Assistente de usuário -------------------------------------------------
@@ -172,22 +200,11 @@ end
 
 local function field(x, y, fw, text, masked)
   local shown = masked and string.rep("*", tlen(text)) or text
-  if tlen(shown) > fw - 3 then shown = unicode.sub(shown, -(fw - 3)) end
+  if tlen(shown) > fw - 3 then shown = shown:sub(-(fw - 3)) end
   gpu.setBackground(C.barBg)
   gpu.setForeground(C.dark)
   gpu.fill(x, y, fw, 3, " ")
   gpu.set(x + 2, y + 1, shown .. "_")
-end
-
-local function appendTo(str, ch, max)
-  if max and tlen(str) >= max then return str end
-  return str .. unicode.char(ch)
-end
-
-local function dropLast(str)
-  local n = unicode.len(str)
-  if n == 0 then return str end
-  return unicode.sub(str, 1, n - 1)
 end
 
 local function submitName()
@@ -223,7 +240,9 @@ end
 
 local function drawSetup()
   sbtns = {}
-  drawWallpaper()
+  local p = WALLPAPERS[wallIdx]
+  gpu.setBackground(p.sky2)
+  gpu.fill(1, 1, w, h, " ")
   local pw_, ph_ = 56, 14
   local px = math.floor((w - pw_) / 2) + 1
   local py = math.floor((h - ph_) / 2) + 1
@@ -281,15 +300,16 @@ local function setupKey(ch, code)
     return
   end
   if code == 14 then                           -- Backspace
-    if s.step == "name" then s.name = dropLast(s.name)
-    elseif s.step == "pass" then s.pw = dropLast(s.pw)
-    elseif s.step == "pass2" then s.pw2 = dropLast(s.pw2) end
+    if s.step == "name" then s.name = s.name:sub(1, -2)
+    elseif s.step == "pass" then s.pw = s.pw:sub(1, -2)
+    elseif s.step == "pass2" then s.pw2 = s.pw2:sub(1, -2) end
     return
   end
-  if ch and ch >= 32 and ch ~= 127 then
-    if s.step == "name" then s.name = appendTo(s.name, ch, 24)
-    elseif s.step == "pass" then s.pw = appendTo(s.pw, ch, 32)
-    elseif s.step == "pass2" then s.pw2 = appendTo(s.pw2, ch, 32) end
+  if ch and ch >= 32 and ch < 127 then
+    local c = string.char(ch)
+    if s.step == "name" and tlen(s.name) < 24 then s.name = s.name .. c
+    elseif s.step == "pass" and #s.pw < 32 then s.pw = s.pw .. c
+    elseif s.step == "pass2" and #s.pw2 < 32 then s.pw2 = s.pw2 .. c end
   end
 end
 
@@ -350,6 +370,10 @@ local function toggleMax(win)
   end
 end
 
+local function bodyOf(win)
+  return { x = win.x, y = win.y + 1, w = win.w, h = win.h - 1 }
+end
+
 local function openWindow(app)
   for _, win in ipairs(windows) do
     if win.app == app then
@@ -361,9 +385,10 @@ local function openWindow(app)
   cascade = (cascade % 5) + 1
   local win = {
     app = app, x = 8 + cascade * 3, y = 4 + cascade * 2,
-    w = 44, h = 14, minimized = false, maxed = false,
+    w = 46, h = 16, minimized = false, maxed = false,
   }
   clampPos(win)
+  if app.init then pcall(app.init, win, CTX) end
   table.insert(windows, win)
 end
 
@@ -390,16 +415,19 @@ local function drawWindow(win, active)
   gpu.setBackground(C.zoom);  gpu.set(x + 6, y, " ")
   gpu.setBackground(active and C.titleActive or C.titleIdle)
   gpu.setForeground(C.menuFg)
-  local title = win.app.name
+  local title = win.app.name or "App"
   gpu.set(x + math.floor((win.w - tlen(title)) / 2), y, title)
 
-  -- corpo
+  -- corpo: o próprio app desenha dentro dele
+  local b = bodyOf(win)
   gpu.setBackground(C.alertBg)
-  gpu.fill(x, y + 1, win.w, win.h - 1, " ")
-  gpu.setForeground(C.dark)
-  for i, line in ipairs(win.app.text) do
-    if i + 1 < win.h then
-      gpu.set(x + 2, y + 1 + i, unicode.sub(line, 1, win.w - 4))
+  gpu.fill(b.x, b.y, b.w, b.h, " ")
+  if win.app.draw then
+    local ok, err = pcall(win.app.draw, win, b, G, CTX)
+    if not ok then
+      gpu.setBackground(C.alertBg)
+      gpu.setForeground(C.red)
+      gpu.set(b.x + 1, b.y, G.clip("Erro no app: " .. tostring(err), b.w - 2))
     end
   end
 
@@ -409,15 +437,15 @@ local function drawWindow(win, active)
   gpu.set(x + win.w - 1, y + win.h - 1, "/")
 end
 
--- Barra de menu e menus suspensos --------------------------------------
+-- Barra de menu e menus suspensos ---------------------------------------
 
 local MENU_TITLES = { "*", "Arquivo", "Editar", "Visualizar", "Janela", "Ajuda" }
 local menuBar = {}
 do
   local x = 2
   for _, name in ipairs(MENU_TITLES) do
-    menuBar[#menuBar + 1] = { name = name, x1 = x, x2 = x + tlen(name) - 1 }
-    x = x + tlen(name) + 3
+    menuBar[#menuBar + 1] = { name = name, x1 = x, x2 = x + #name - 1 }
+    x = x + #name + 3
   end
 end
 
@@ -470,26 +498,44 @@ local function drawDock()
   gpu.fill(dockX0, dockY, dockW, 3, " ")
   for i, app in ipairs(apps) do
     local x = dockX0 + 1 + (i - 1) * 6
-    gpu.setBackground(app.color)
-    gpu.fill(x, dockY, 5, 2, " ")
-    gpu.setForeground(C.white)
-    gpu.set(x + 2, dockY, app.letter)
+    if app.icon and app.icon.draw then
+      pcall(app.icon.draw, G, x, dockY)
+    else
+      gpu.setBackground(app.color or 0x7F8C8D)
+      gpu.fill(x, dockY, 5, 2, " ")
+      gpu.setForeground(C.white)
+      gpu.set(x + 2, dockY, app.letter or "?")
+    end
   end
 end
 
 local function drawDockLabel()
-  if not dockLabel then return end
+  if not dockLabel or not apps[dockLabel.idx] then return end
   local text = " " .. apps[dockLabel.idx].name .. " "
-  local tl = tlen(text)
   local cx = dockX0 + 1 + (dockLabel.idx - 1) * 6 + 2
-  local x = math.max(1, math.min(w - tl + 1, cx - math.floor(tl / 2)))
+  local x = math.max(1, math.min(w - #text + 1, cx - math.floor(#text / 2)))
   gpu.setBackground(C.menuBg)
   gpu.setForeground(C.menuFg)
   gpu.set(x, dockY - 1, text)
 end
 
 local function redraw()
-  drawWallpaper()
+  local p = WALLPAPERS[wallIdx]
+  local top, bottom = 2, h - 4
+  for y = top, bottom do
+    local t = (y - top) / math.max(1, bottom - top)
+    gpu.setBackground(mix(p.sky2, p.sky1, t))
+    gpu.fill(1, y, w, 1, " ")
+  end
+  local rx = math.floor(w * (p.rockX or 0.08))
+  local rw = math.floor(w * (p.rockW or 0.30))
+  local rh = math.floor(h * (p.rockH or 0.35))
+  gpu.setBackground(p.rock or 0xC0643A)
+  gpu.fill(rx + 1, 6, rw, rh, " ")
+  local gy = math.floor(h * 0.7)
+  gpu.setBackground(p.ground or 0x2F4A3B)
+  gpu.fill(1, gy, w, bottom - gy + 1, " ")
+
   local active = topWindow()
   for _, win in ipairs(windows) do
     if not win.minimized then drawWindow(win, win == active) end
@@ -540,7 +586,7 @@ local MENU_ITEMS = {
   ["Visualizar"] = { { "Trocar fundo", nextWallpaper } },
   ["Janela"]     = { { "Minimizar", minimizeTop }, { "Restaurar todas", restoreAll },
                      { "Maximizar / Restaurar", zoomTop } },
-  ["Ajuda"]      = { { "Sobre (em breve)" } },
+  ["Ajuda"]      = { { "Sobre o Plasma OS " .. VERSION } },
 }
 
 -- Eventos da área de trabalho ------------------------------------------
@@ -574,7 +620,7 @@ local function handleTouch(x, y)
   end
 
   -- dock
-  if y >= dockY and y <= dockY + 1 then
+  if y >= dockY and y <= dockY + 2 then
     local rel = x - dockX0 - 1
     if rel >= 0 then
       local idx = math.floor(rel / 6) + 1
@@ -588,17 +634,19 @@ local function handleTouch(x, y)
 
   -- janelas
   local win = windowAt(x, y)
-  if win then
-    bringToFront(win)
-    if y == win.y then
-      if x == win.x + 2 then closeWindow(win); return
-      elseif x == win.x + 4 then win.minimized = true; return
-      elseif x == win.x + 6 then toggleMax(win); return
-      end
-      dragging = { win = win, dx = x - win.x, dy = y - win.y }
-    elseif x == win.x + win.w - 1 and y == win.y + win.h - 1 then
-      resizing = win
+  if not win then return end
+  bringToFront(win)
+
+  if y == win.y then
+    if x == win.x + 2 then closeWindow(win); return
+    elseif x == win.x + 4 then win.minimized = true; return
+    elseif x == win.x + 6 then toggleMax(win); return
     end
+    dragging = { win = win, dx = x - win.x, dy = y - win.y }
+  elseif x == win.x + win.w - 1 and y == win.y + win.h - 1 then
+    resizing = win
+  elseif win.app.touch then
+    pcall(win.app.touch, win, bodyOf(win), x, y, CTX)
   end
 end
 
@@ -620,6 +668,16 @@ local function handleDrag(x, y)
   end
 end
 
+-- Teclado: vai para a janela da frente. Q sai só se ela não usa teclado.
+local function handleKey(ch, code)
+  local top = topWindow()
+  if top and top.app.key then
+    pcall(top.app.key, top, ch, code, CTX)
+    return
+  end
+  if ch == 113 or ch == 81 then running = false end
+end
+
 local function desktop()
   redraw()
   while running do
@@ -632,9 +690,7 @@ local function desktop()
       dragging = nil
       resizing = nil
     elseif sig == "key_down" then
-      if a == 113 or a == 81 or b == 16 then  -- q / Q
-        running = false
-      end
+      handleKey(a, b)
     end
     if dockLabel and computer.uptime() > dockLabel.untilT then dockLabel = nil end
     redraw()
@@ -653,7 +709,15 @@ local function main()
   if not user then
     user = runSetup()
   end
-  apps[7].text = { "Usuário: " .. user.name, "Versão " .. VERSION }
+
+  CTX.fs            = bootFs
+  CTX.user          = user.name
+  CTX.version       = VERSION
+  CTX.nextWallpaper = nextWallpaper
+  CTX.trechos       = TRECHOS
+  CTX.G             = G
+
+  layoutDock()
   desktop()
 end
 
