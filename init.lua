@@ -1,7 +1,7 @@
 -- Plasma OS - init.lua (bootstrapper)
 -- Sem OpenOS. Fica na raiz do disco.
 
-local BOOT_FILE    = "/PlasmaOS/boot.lua"
+local BOOT_FILE    = "/plasmaOS/boot.lua"
 local INSTALLER_URL = "https://raw.githubusercontent.com/pmiguel10766-stack/-opencomputers-script/refs/heads/main/instalador.lua"
 local TIMEOUT   = 30
 local ATTEMPTS  = 2
