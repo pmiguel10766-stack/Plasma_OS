@@ -1,10 +1,11 @@
 -- Plasma OS - init.lua (bootstrapper)
 -- Sem OpenOS. Fica na raiz do disco.
 
-local BOOT_FILE    = "/PlasmaOS/boot.lua"
+local BOOT_FILE     = "/PlasmaOS/boot.lua"
 local INSTALLER_URL = "https://raw.githubusercontent.com/pmiguel10766-stack/-opencomputers-script/refs/heads/main/instalador.lua"
-local TIMEOUT   = 30
-local ATTEMPTS  = 2
+local TIMEOUT  = 30
+local ATTEMPTS = 2
+local CHUNK    = 2048
 
 local gpu = component.proxy(component.list("gpu")())
 gpu.bind(component.list("screen")())
@@ -29,19 +30,27 @@ local function clear()
   line = 1
 end
 
+local function readAll(fs, h)
+  local parts = {}
+  while true do
+    local chunk, reason = fs.read(h, CHUNK)
+    if chunk then
+      parts[#parts + 1] = chunk
+    else
+      if reason then return nil, tostring(reason) end
+      return table.concat(parts)
+    end
+  end
+end
+
 local function readFile(path)
   local fs = component.proxy(computer.getBootAddress())
   if not fs.exists(path) then return nil end
   local h, err = fs.open(path, "r")
   if not h then return nil, err end
-  local parts = {}
-  while true do
-    local chunk = fs.read(h, math.huge)
-    if not chunk then break end
-    parts[#parts + 1] = chunk
-  end
+  local data, rerr = readAll(fs, h)
   fs.close(h)
-  return table.concat(parts)
+  return data, rerr
 end
 
 local function download(url)
@@ -66,7 +75,7 @@ local function download(url)
 
   local parts = {}
   while true do
-    local chunk, reason = h.read(math.huge)
+    local chunk, reason = h.read(CHUNK)
     if chunk then
       parts[#parts + 1] = chunk
     else
@@ -93,7 +102,7 @@ local function start()
     local ok, err = runSource(boot, BOOT_FILE)
     if not ok then
       say("Erro ao iniciar " .. BOOT_FILE, 0xFF5555)
-      say(err, 0xFF5555)
+      say(tostring(err), 0xFF5555)
       say("Pressione uma tecla para tentar de novo.")
       repeat local sig = computer.pullSignal() until sig == "key_down"
       return start()
@@ -101,6 +110,7 @@ local function start()
     return
   end
 
+  if rerr then say("Erro ao ler boot: " .. tostring(rerr), 0xFF5555) end
   say("Plasma OS não encontrado. Baixando instalador...")
 
   local lastErr
