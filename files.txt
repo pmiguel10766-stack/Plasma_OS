@@ -22,4 +22,5 @@ PlasmaOS/apps/mensagens.lua
 PlasmaOS/apps/ajustes.lua
 PlasmaOS/apps/lixeira.lua
 PlasmaOS/apps/editor-lua.lua
-
+PlasmaOS/apps/rede-local.lua
+PlasmaOS/apps/loja.lua
