@@ -58,10 +58,25 @@ local function decode(s)
   return s
 end
 
+-- Conteúdo que nunca é texto de leitura
+local HIDDEN = {
+  "script", "style", "noscript", "svg", "template", "head", "iframe", "object", "canvas",
+}
+
+-- Tags que quebram a linha
 local BLOCK = {
   p = 1, div = 1, br = 1, li = 1, tr = 1, ul = 1, ol = 1, table = 1,
   section = 1, article = 1, header = 1, footer = 1, blockquote = 1, pre = 1,
-  h1 = 1, h2 = 1, h3 = 1, h4 = 1, h5 = 1, h6 = 1,
+  h1 = 1, h2 = 1, h3 = 1, h4 = 1, h5 = 1, h6 = 1, dl = 1, dt = 1, dd = 1,
+  nav = 1, main = 1, aside = 1, form = 1, hr = 1, figure = 1, figcaption = 1,
+  option = 1, td = 1, th = 1,
+}
+
+-- Tags de texto corrido: não separam palavras (ex.: <b>Pa</b>lavra continua "Palavra")
+local INLINE = {
+  a = 1, span = 1, b = 1, i = 1, em = 1, strong = 1, font = 1, u = 1, s = 1,
+  small = 1, big = 1, sup = 1, sub = 1, code = 1, abbr = 1, label = 1,
+  mark = 1, strike = 1,
 }
 
 -- "script" -> "[Ss][Cc][Rr][Ii][Pp][Tt]" (padrão sem diferenciar maiúsculas)
@@ -123,8 +138,9 @@ local function htmlToText(src)
   local links = {}
   local s = src:gsub("\r", "")
   s = s:gsub("<!%-%-.-%-%->", "")
-  s = s:gsub("<" .. ci("script") .. ".-</" .. ci("script") .. "%s*>", "")
-  s = s:gsub("<" .. ci("style") .. ".-</" .. ci("style") .. "%s*>", "")
+  for _, name in ipairs(HIDDEN) do
+    s = s:gsub("<" .. ci(name) .. "[%s>/].-</" .. ci(name) .. "%s*>", " ")
+  end
 
   -- <a href="..."> vira marcador de início; </a> vira marcador de fim
   s = s:gsub("<%s*[Aa]%f[%s>][^>]*>", function(tag)
@@ -144,9 +160,18 @@ local function htmlToText(src)
 
   s = s:gsub("<[^>]*>", function(tag)
     local name = tag:match("^<%s*/?%s*(%a[%w]*)")
-    if name and BLOCK[name:lower()] then return "\n" end
-    return ""
+    local n = name and name:lower()
+    if n and BLOCK[n] then return "\n" end
+    if n and INLINE[n] then return "" end
+    return " "
   end)
+
+  -- restos de CSS ou JS que escaparam (blocos { prop: valor; ... })
+  s = s:gsub("%b{}", function(b)
+    if b:find(":", 1, true) and b:find(";", 1, true) then return " " end
+    return b
+  end)
+
   s = decode(s)
   s = s:gsub("[ \t]+", " ")
   s = s:gsub(" *\n *", "\n")
