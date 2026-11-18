@@ -4,7 +4,7 @@
 -- Modo Leitura: só o texto, sem anúncios, menus, banners e pop-ups; espaçamento ajustável.
 -- ↑ ↓ e PgUp/PgDn rolam. Enter na barra de endereço carrega o endereço. Ctrl+R troca o modo.
 
-local TIMEOUT      = 20          -- segundos até desistir de uma conexão
+local TIMEOUT      = 15          -- segundos até desistir de uma conexão
 local MAX_BODY     = 200 * 1024  -- corta páginas maiores que isso
 local MAX_REDIRECT = 3
 
@@ -248,6 +248,10 @@ end
 
 local function fail(s, msg)
   closeHandle(s)
+  -- em HTTPS, a falha costuma ser o TLS da placa: sugere tentar HTTP
+  if msg and msg:find("Tempo esgotado") and s.reqUrl and s.reqUrl:match("^https://") then
+    msg = msg .. " Se for HTTPS, a placa pode não suportar este site. Tente http://"
+  end
   s.msg = msg
 end
 
@@ -354,7 +358,7 @@ local function finish(s)
   end
 end
 
--- Chamado a cada redesenho: avança a conexão sem travar a interface
+-- Avança a conexão sem travar a interface. Chamado no redesenho e nos eventos
 local function poll(s)
   local h = s.handle
   if not h then return end
@@ -385,6 +389,7 @@ local function navigate(s)
   local url = s.input:match("^%s*(.-)%s*$")
   if url == "" then return end
   if not url:match("^%a[%w+.-]*://") then url = "http://" .. url end
+  closeHandle(s)  -- cancela qualquer conexão presa antes de começar outra
   s.scroll = 0
   s.focusMode = false
   startRequest(s, url, 0)
@@ -413,6 +418,7 @@ local function followLink(s, idx)
   s.input = url
   s.scroll = 0
   s.focusMode = false
+  closeHandle(s)
   startRequest(s, url, 0)
 end
 
@@ -745,6 +751,7 @@ return {
   touch = function(win, b, x, y, ctx)
     local s = win.state
     s.ctx = ctx or s.ctx
+    poll(s)  -- verifica timeout também em cada clique
 
     if y == b.y and x >= menuX(b) and x < menuX(b) + 7 then
       s.menu = not s.menu
@@ -804,6 +811,7 @@ return {
 
   key = function(win, ch, code, ctx)
     local s = win.state
+    poll(s)  -- verifica timeout também em cada tecla
     if code == 28 or code == 156 then                 -- Enter
       if s.focusMode and s.focus then
         followLink(s, s.focus)
