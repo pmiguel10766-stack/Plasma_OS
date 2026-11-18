@@ -166,11 +166,10 @@ local function htmlToText(src)
     return " "
   end)
 
-  -- restos de CSS ou JS que escaparam (blocos { prop: valor; ... })
-  s = s:gsub("%b{}", function(b)
-    if b:find(":", 1, true) and b:find(";", 1, true) then return " " end
-    return b
-  end)
+  -- restos de CSS ou JS que escaparam: qualquer bloco entre chaves some do texto
+  -- (texto de leitura nunca precisa de chaves; regras como .x{display:none} e @media viram nada)
+  s = s:gsub("%b{}", " ")
+  s = s:gsub("[{}]", " ")
 
   s = decode(s)
   s = s:gsub("[ \t]+", " ")
@@ -278,6 +277,43 @@ local function startRequest(s, url, depth)
   s.msg     = "Carregando..."
 end
 
+-- Histórico (guardado em arquivo, para sobreviver a reinícios) -------------
+
+local HIST_PATH = "/PlasmaOS/safari-historico.txt"
+local HIST_MAX  = 100
+
+local function loadHist(ctx)
+  local out = {}
+  if not ctx or not ctx.fs or not ctx.fs.exists(HIST_PATH) then return out end
+  local h = ctx.fs.open(HIST_PATH, "r")
+  if not h then return out end
+  local parts = {}
+  repeat
+    local chunk = ctx.fs.read(h, math.huge)
+    if chunk then parts[#parts + 1] = chunk end
+  until not chunk
+  ctx.fs.close(h)
+  for line in table.concat(parts):gmatch("[^\n]+") do out[#out + 1] = line end
+  return out
+end
+
+local function saveHist(s)
+  local ctx = s.ctx
+  if not ctx or not ctx.fs then return end
+  local h = ctx.fs.open(HIST_PATH, "w")
+  if not h then return end
+  ctx.fs.write(h, table.concat(s.hist, "\n"))
+  ctx.fs.close(h)
+end
+
+local function addHistory(s, url)
+  if not url or url == "" then return end
+  if s.hist[1] == url then return end
+  table.insert(s.hist, 1, url)
+  while #s.hist > HIST_MAX do table.remove(s.hist) end
+  saveHist(s)
+end
+
 local function finish(s)
   local h = s.handle
   local okr, code, reason, headers = pcall(h.response)
@@ -300,6 +336,7 @@ local function finish(s)
   local cleaned, removed = removeJunk(raw)
   local readText = htmlToText(cleaned)
 
+  if code < 400 then addHistory(s, s.reqUrl) end
   s.text      = text
   s.links     = links
   s.readText  = readText
@@ -478,11 +515,98 @@ local function drawLine(g, s, x, y, line, width, fgc, bgc)
   end
 end
 
+local function menuX(b)
+  return b.x + b.w - 6 - 7 - 1
+end
+
+local MENU_ITEMS = { "Nova janela", "Histórico", "Dados" }
+
+local function drawMenu(s, b, g)
+  local x0 = menuX(b)
+  local w = 16
+  g.fill(x0 + 1, b.y + 3, w, #MENU_ITEMS + 1, 0x59636E)
+  g.fill(x0, b.y + 2, w, #MENU_ITEMS + 1, PANEL)
+  for i, label in ipairs(MENU_ITEMS) do
+    g.text(x0 + 2, b.y + 2 + i, label, INK, PANEL)
+  end
+end
+
+local function handleMenuClick(s, b, x, y, ctx)
+  local x0 = menuX(b)
+  local idx = y - (b.y + 2)
+  if x < x0 or x >= x0 + 16 or idx < 1 or idx > #MENU_ITEMS then return false end
+  s.menu = false
+  if idx == 1 then
+    if ctx and ctx.newWindow then ctx.newWindow("safari") end
+  elseif idx == 2 then
+    s.view = "history"
+  elseif idx == 3 then
+    s.view = "data"
+  end
+  return true
+end
+
+local function drawView(s, b, g)
+  local title = (s.view == "history") and "Histórico" or "Dados"
+  g.fill(b.x, b.y + 2, b.w, b.h - 2, PANEL)
+  g.fill(b.x, b.y + 2, b.w, 1, BAR)
+  g.fill(b.x, b.y + 3, b.w, 1, SEP)
+  g.text(b.x + 1, b.y + 2, "‹ Voltar", BLUE, BAR)
+  g.text(b.x + math.max(0, math.floor((b.w - len(title)) / 2)), b.y + 2, title, INK, BAR)
+
+  if s.view == "history" then
+    if #s.hist == 0 then
+      g.text(b.x + 2, b.y + 5, "Nenhuma página no histórico.", DIM, PANEL)
+      return
+    end
+    for i, url in ipairs(s.hist) do
+      local y = b.y + 3 + i
+      if y >= b.y + b.h then break end
+      g.text(b.x + 2, y, g.clip(url, b.w - 4), BLUE, PANEL)
+    end
+  else
+    local size = 0
+    if s.ctx and s.ctx.fs then
+      local ok, n = pcall(s.ctx.fs.size, HIST_PATH)
+      if ok and type(n) == "number" then size = n end
+    end
+    g.text(b.x + 2, b.y + 5, "Páginas guardadas: " .. #s.hist, INK, PANEL)
+    g.text(b.x + 2, b.y + 6, "Tamanho do histórico: " .. size .. " bytes", INK, PANEL)
+    g.text(b.x + 2, b.y + 7, "Página atual: " .. #(s.text or "") .. " bytes de texto", INK, PANEL)
+    g.fill(b.x + 2, b.y + 9, 18, 1, 0xD93025)
+    g.text(b.x + 4, b.y + 9, "Apagar histórico", 0xFFFFFF, 0xD93025)
+  end
+end
+
+local function handleViewClick(s, b, x, y)
+  if y == b.y + 2 then
+    if x < b.x + 10 then s.view = nil; return true end
+    return true
+  end
+  if s.view == "history" then
+    local idx = y - (b.y + 4)
+    local url = s.hist[idx]
+    if url then
+      s.view = nil
+      s.input = url
+      navigate(s)
+    end
+    return true
+  end
+  if s.view == "data" and y == b.y + 9 and x >= b.x + 2 and x < b.x + 20 then
+    s.hist = {}
+    saveHist(s)
+    return true
+  end
+  return true
+end
+
 return {
   name = "Safari", letter = "S", color = 0x2F80ED,
 
-  init = function(win)
+  init = function(win, ctx)
     win.state = win.state or {
+      ctx = ctx, hist = loadHist(ctx), menu = false, view = nil,
       input = "", page = "", reqUrl = nil,
       msg = "Digite um endereço e pressione Enter.",
       text = nil, readText = nil, links = nil, lines = nil, wrapW = nil,
@@ -504,8 +628,9 @@ return {
 
     -- barra de endereço
     g.fill(b.x, b.y, b.w, 1, BAR)
-    local btnW = 6
-    local fieldW = b.w - btnW - 2
+    local btnW, menuW = 6, 7
+    local menuX = b.x + b.w - btnW - menuW - 1
+    local fieldW = menuX - b.x - 2
     g.fill(b.x + 1, b.y, fieldW, 1, PANEL)
     local shown, fg
     if s.input == "" then
@@ -516,6 +641,9 @@ return {
     local maxw = fieldW - 2
     if len(shown) > maxw then shown = usub(shown, len(shown) - maxw + 1) end
     g.text(b.x + 2, b.y, shown, fg, PANEL)
+
+    g.fill(menuX, b.y, menuW, 1, s.menu and BLUE or 0xE5E5EA)
+    g.text(menuX + 1, b.y, "Menu", s.menu and 0xFFFFFF or INK, s.menu and BLUE or 0xE5E5EA)
 
     local bx = b.x + b.w - btnW
     g.fill(bx, b.y, btnW, 1, BLUE)
@@ -531,6 +659,12 @@ return {
     modeBtn(g, b.x + 14, r2, 17, "Leitura (texto)", reading)
     modeBtn(g, b.x + b.w - 11, r2, 10, "Aviso", s.showWarn)
     g.fill(b.x, r2 + 1, b.w, 1, SEP)
+    s.ctx = ctx
+    if s.view then
+      drawView(s, b, g)
+      return
+    end
+
     local top = b.y + 4
 
     -- linha do modo leitura: espaçamento
@@ -599,6 +733,8 @@ return {
         g.clip(msg, b.w - 2), DIM, pageBg)
     end
 
+    if s.menu then drawMenu(s, b, g) end
+
     if statusRow then
       local bg = s.msg and BAR or HINT_BG
       g.fill(b.x, statusRow, b.w, 1, bg)
@@ -608,6 +744,21 @@ return {
 
   touch = function(win, b, x, y, ctx)
     local s = win.state
+    s.ctx = ctx or s.ctx
+
+    if y == b.y and x >= menuX(b) and x < menuX(b) + 7 then
+      s.menu = not s.menu
+      return
+    end
+    if s.menu then
+      handleMenuClick(s, b, x, y, ctx)
+      s.menu = false
+      return
+    end
+    if s.view then
+      handleViewClick(s, b, x, y)
+      return
+    end
 
     -- barra de endereço: botão Ir
     if y == b.y then
