@@ -1,12 +1,13 @@
--- Plasma OS - Safari: navegador HTTP/HTTPS (texto puro, sem imagens, CSS ou JS)
+-- Plasma OS - Safari: navegador 67 (texto puro, sem imagens, CSS ou JS)
 -- Precisa de uma placa de rede (internet card).
 -- Modo Normal: página completa, links azuis (clique, ou Tab + Enter).
 -- Modo Leitura: só o texto, sem anúncios, menus, banners e pop-ups; espaçamento ajustável.
 -- ↑ ↓ e PgUp/PgDn rolam. Enter na barra de endereço carrega o endereço. Ctrl+R troca o modo.
 
-local TIMEOUT      = 15          -- segundos até desistir de uma conexão
-local MAX_BODY     = 200 * 1024  -- corta páginas maiores que isso
-local MAX_REDIRECT = 3
+local TIMEOUT        = 15          -- segundos até desistir de uma conexão
+local MAX_BODY       = 64 * 1024   -- páginas maiores são cortadas (evita o limite de 5 s do OpenComputers)
+local MAX_REDIRECT   = 3
+local READS_PER_FRAME = 8          -- pedaços lidos da rede por redesenho
 
 local PANEL, INK, DIM   = 0xFFFFFF, 0x1D1D1F, 0x86868B
 local BLUE, FOCUS_BG    = 0x0A84FF, 0xDCEBFF
@@ -90,19 +91,23 @@ local DROP_TAGS = {
   button = 1, select = 1, object = 1, embed = 1, dialog = 1, template = 1,
   canvas = 1, video = 1, audio = 1,
 }
-local JUNK_WORDS = {
-  "ad", "ads", "advert", "advertisement", "banner", "menu", "popup", "pop%-up",
+
+-- Palavras de class/id que indicam "lixo" visual. Busca em conjunto: muito mais rápida
+local JUNK_SET = {}
+for _, w in ipairs({
+  "ad", "ads", "advert", "advertisement", "banner", "menu", "popup", "pop-up",
   "modal", "cookie", "cookies", "sidebar", "promo", "sponsor", "share", "social",
   "newsletter", "subscribe", "breadcrumb", "widget", "related", "taboola", "outbrain",
-}
+}) do JUNK_SET[w] = true end
 
+-- Verifica o valor de class="" e id="" da tag (uma vez por tag, sem muitos padrões)
 local function isJunkTag(tag)
-  local attrs = tag:lower()
-  for _, w in ipairs(JUNK_WORDS) do
-    if attrs:find("class%s*=%s*[\"'][^\"']*%f[%w]" .. w .. "%f[%W]")
-      or attrs:find("id%s*=%s*[\"'][^\"']*%f[%w]" .. w .. "%f[%W]") then
-      return true
-    end
+  local low = tag:lower()
+  local cls = low:match('class%s*=%s*"([^"]*)"') or low:match("class%s*=%s*'([^']*)'") or ""
+  local idv = low:match('id%s*=%s*"([^"]*)"') or low:match("id%s*=%s*'([^']*)'") or ""
+  if cls == "" and idv == "" then return false end
+  for w in (cls .. " " .. idv):gmatch("[%w%-_]+") do
+    if JUNK_SET[w] then return true end
   end
   return false
 end
@@ -120,7 +125,7 @@ local function removeJunk(src)
     end
     local lname = name:lower()
     local tag = src:sub(s1, e1)
-    if DROP_TAGS[lname] or (isJunkTag(tag) and lname ~= "html" and lname ~= "body") then
+    if DROP_TAGS[lname] or (lname ~= "html" and lname ~= "body" and isJunkTag(tag)) then
       out[#out + 1] = src:sub(pos, s1 - 1)
       removed = removed + 1
       local _, ce = lower:find("</" .. lname .. "%s*>", e1 + 1)
@@ -167,7 +172,6 @@ local function htmlToText(src)
   end)
 
   -- restos de CSS ou JS que escaparam: qualquer bloco entre chaves some do texto
-  -- (texto de leitura nunca precisa de chaves; regras como .x{display:none} e @media viram nada)
   s = s:gsub("%b{}", " ")
   s = s:gsub("[{}]", " ")
 
@@ -248,6 +252,8 @@ end
 
 local function fail(s, msg)
   closeHandle(s)
+  s.stage = nil
+  s.raw = nil
   -- em HTTPS, a falha costuma ser o TLS da placa: sugere tentar HTTP
   if msg and msg:find("Tempo esgotado") and s.reqUrl and s.reqUrl:match("^https://") then
     msg = msg .. " Se for HTTPS, a placa pode não suportar este site. Tente http://"
@@ -257,6 +263,8 @@ end
 
 local function startRequest(s, url, depth)
   closeHandle(s)
+  s.stage = nil
+  s.raw = nil
   local addr = component.list("internet")()
   if not addr then
     s.msg = "Sem placa de rede (internet card)."
@@ -318,6 +326,7 @@ local function addHistory(s, url)
   saveHist(s)
 end
 
+-- Fim do download: junta o corpo e agenda o processamento em etapas
 local function finish(s)
   local h = s.handle
   local okr, code, reason, headers = pcall(h.response)
@@ -334,31 +343,47 @@ local function finish(s)
     end
   end
 
-  local raw = table.concat(s.body)
-  local text, links = htmlToText(raw)
-  if text == "" then text = "(Página vazia)" end
-  local cleaned, removed = removeJunk(raw)
-  local readText = htmlToText(cleaned)
+  s.code, s.reason = code, reason
+  s.raw   = table.concat(s.body)
+  s.body  = {}
+  s.stage = "junk"
+  s.msg   = "Processando página..."
+end
 
-  if code < 400 then addHistory(s, s.reqUrl) end
-  s.text      = text
-  s.links     = links
-  s.readText  = readText
-  s.removed   = removed
-  s.lines     = nil
-  s.wrapW     = nil
-  s.page      = s.reqUrl
-  s.scroll    = 0
-  s.focus     = nil
-  s.focusMode = false
-  if code >= 400 then
-    s.msg = "Erro " .. code .. (reason and (" " .. tostring(reason)) or "")
-  else
-    s.msg = nil
+-- Processa UMA etapa por redesenho, para nenhuma etapa travar o sistema
+local function process(s)
+  local st = s.stage
+  if not st then return end
+  if st == "junk" then
+    s.cleaned, s.removed = removeJunk(s.raw)
+    s.stage = "text"
+  elseif st == "text" then
+    local text, links = htmlToText(s.raw)
+    if text == "" then text = "(Página vazia)" end
+    s.text, s.links = text, links
+    s.stage = "read"
+  elseif st == "read" then
+    s.readText = htmlToText(s.cleaned)
+    s.stage = "commit"
+  elseif st == "commit" then
+    if s.code < 400 then addHistory(s, s.reqUrl) end
+    s.page      = s.reqUrl
+    s.lines     = nil
+    s.wrapW     = nil
+    s.scroll    = 0
+    s.focus     = nil
+    s.focusMode = false
+    s.raw, s.cleaned = nil, nil
+    s.stage = nil
+    if s.code >= 400 then
+      s.msg = "Erro " .. s.code .. (s.reason and (" " .. tostring(s.reason)) or "")
+    else
+      s.msg = nil
+    end
   end
 end
 
--- Avança a conexão sem travar a interface. Chamado no redesenho e nos eventos
+-- Avança a conexão sem travar a interface. Lê no máximo READS_PER_FRAME pedaços por vez
 local function poll(s)
   local h = s.handle
   if not h then return end
@@ -372,7 +397,9 @@ local function poll(s)
     return
   end
 
-  while s.size < MAX_BODY do
+  local reads = 0
+  while s.size < MAX_BODY and reads < READS_PER_FRAME do
+    reads = reads + 1
     local okr, chunk, reason = pcall(h.read, math.huge)
     if not okr then return fail(s, "Erro ao ler: " .. tostring(chunk)) end
     if not chunk then
@@ -382,7 +409,7 @@ local function poll(s)
     s.body[#s.body + 1] = chunk
     s.size = s.size + #chunk
   end
-  finish(s)  -- limite de tamanho atingido
+  if s.size >= MAX_BODY then finish(s) end  -- limite de tamanho atingido
 end
 
 local function navigate(s)
@@ -621,12 +648,14 @@ return {
       mode = "normal", showWarn = true, removed = 0,
       gap = 0,
       handle = nil, body = {}, size = 0, depth = 0, started = 0,
+      stage = nil, raw = nil, cleaned = nil,
     }
   end,
 
   draw = function(win, b, g, ctx)
     local s = win.state
     poll(s)
+    process(s)  -- uma etapa de processamento por redesenho
     s.hits = {}
     local reading = (s.mode == "reading")
 
@@ -653,7 +682,7 @@ return {
 
     local bx = b.x + b.w - btnW
     g.fill(bx, b.y, btnW, 1, BLUE)
-    g.text(bx + 2, b.y, s.handle and "..." or "Ir", 0xFFFFFF, BLUE)
+    g.text(bx + 2, b.y, (s.handle or s.stage) and "..." or "Ir", 0xFFFFFF, BLUE)
 
     -- separador
     g.fill(b.x, b.y + 1, b.w, 1, SEP)
@@ -689,7 +718,7 @@ return {
     g.fill(b.x, top, b.w, ph, pageBg)
 
     -- aviso logo abaixo dos botões (quando há página e o aviso está ligado)
-    if s.showWarn and s.text ~= nil then
+    if s.showWarn and s.text ~= nil and not s.stage then
       local txt
       if reading then
         if (s.removed or 0) > 0 then
@@ -717,7 +746,7 @@ return {
       ph = ph - 1
     end
 
-    local lines = layout(s, math.max(10, b.w - 2))
+    local lines = (not s.stage) and layout(s, math.max(10, b.w - 2)) or nil
     if lines then
       local maxScroll = math.max(0, #lines - ph)
       if s.scroll > maxScroll then s.scroll = maxScroll end
@@ -732,7 +761,7 @@ return {
         g.text(b.x + b.w - len(lab) - 1, top + ph - 1, lab, DIM, pageBg)
       end
     else
-      -- sem página ainda: mensagem centralizada
+      -- sem página ainda (ou processando): mensagem centralizada
       local msg = s.msg or "Digite um endereço e pressione Enter."
       local cy = top + math.floor(ph / 2)
       g.text(b.x + math.max(1, math.floor((b.w - len(msg)) / 2)), cy,
